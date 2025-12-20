@@ -1,0 +1,5 @@
+{
+  "name": "Project Watcher Dashboard",
+  "description": "Visualizes project health from Google Sheets, calculating project rot and providing AI-powered insights.",
+  "requestFramePermissions": []
+}
