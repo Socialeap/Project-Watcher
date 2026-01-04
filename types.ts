@@ -1,8 +1,11 @@
 export enum ProjectStatus {
-  ACTIVE = 'Active',
-  ON_HOLD = 'On Hold',
-  COMPLETED = 'Completed',
-  ARCHIVED = 'Archived'
+  NEW = 'NEW ✨',
+  ACTIVE = 'Active ✅',
+  EXTENDED = 'Extended ⏳',
+  NEGLECTED = 'Neglected ⚠️',
+  ABANDONED = 'Abandoned? 🕸️',
+  COMPLETED = 'Completed ✔️',
+  ARCHIVED = 'Archived 🗄️'
 }
 
 export enum RotLevel {
@@ -16,6 +19,8 @@ export interface Project {
   name: string;
   lastTouched: string; // ISO Date string
   status: ProjectStatus;
+  links: string;       // Renamed from log to links
+  tags: string;        // New field for Column G
   owner?: string;
 }
 
@@ -29,4 +34,10 @@ export interface AIInsight {
   summary: string;
   actionItems: string[];
   priorityScore: number;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'model';
+  text: string;
+  timestamp: Date;
 }
