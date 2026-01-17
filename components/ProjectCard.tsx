@@ -154,13 +154,13 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({ analysis, onStatusChan
                 type="text"
                 value={editForm.name}
                 onChange={(e) => setEditForm({...editForm, name: e.target.value})}
-                className="w-full bg-slate-950 border-2 border-slate-700 rounded-2xl px-5 py-4 text-white font-black text-xl focus:border-indigo-500 outline-none mb-6"
+                className="w-full bg-slate-950 border-2 border-slate-700 rounded-2xl px-5 py-4 text-emerald-400 font-medium text-xl focus:border-indigo-500 outline-none mb-6"
                 placeholder="Project Name"
                 autoFocus
              />
         ) : (
             <div className="mb-8">
-                <h3 className="font-black text-2xl text-white leading-[1.1] break-words tracking-tighter group-hover/card:text-indigo-200 transition-colors">
+                <h3 className="font-medium text-2xl text-emerald-400 leading-tight break-words tracking-normal group-hover/card:text-emerald-300 transition-colors">
                   {project.name}
                 </h3>
             </div>

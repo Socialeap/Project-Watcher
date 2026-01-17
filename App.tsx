@@ -1,7 +1,7 @@
 
 import React, { useEffect, useState, useMemo } from 'react';
 import { ProjectAnalysis, ProjectStatus, RotLevel } from './types';
-import { fetchProjects, analyzeProjects, updateProjectStatus, updateProjectDetails } from './services/dataService';
+import { fetchProjects, analyzeProjects, updateProjectStatus, updateProjectDetails, HARDCODED_SPREADSHEET_ID } from './services/dataService';
 import { initGoogleClient, handleSignOut, HARDCODED_CLIENT_ID } from './services/authService';
 import { ProjectCard } from './components/ProjectCard';
 import { AIInsights } from './components/AIInsights';
@@ -11,14 +11,26 @@ import { NewProjectModal } from './components/NewProjectModal';
 type SortOrder = 'DEFAULT' | 'FRESH_FIRST' | 'NEGLECTED_FIRST' | 'ABANDONED_FIRST' | 'COMPLETED_FIRST';
 
 const App: React.FC = () => {
+  // Logic: Use hardcoded constant if valid (not the placeholder), otherwise check localStorage
   const getStoredId = () => {
-    const stored = localStorage.getItem('google_client_id');
-    if (stored) return stored;
-    return (HARDCODED_CLIENT_ID as string) !== 'YOUR_CLIENT_ID_STRING_HERE' ? HARDCODED_CLIENT_ID : '';
+    // Check if it exists and is NOT the placeholder
+    if (HARDCODED_CLIENT_ID && HARDCODED_CLIENT_ID !== 'YOUR_CLIENT_ID_HERE' && HARDCODED_CLIENT_ID !== 'YOUR_CLIENT_ID_STRING_HERE') {
+        return HARDCODED_CLIENT_ID;
+    }
+    return localStorage.getItem('google_client_id') || '';
+  };
+  
+  const getStoredSheetId = () => {
+    if (HARDCODED_SPREADSHEET_ID && HARDCODED_SPREADSHEET_ID !== 'YOUR_SPREADSHEET_ID_HERE') {
+        return HARDCODED_SPREADSHEET_ID;
+    }
+    return localStorage.getItem('google_spreadsheet_id') || '';
   };
 
   const [clientId, setClientId] = useState<string>(getStoredId());
+  const [sheetId, setSheetId] = useState<string>(getStoredSheetId());
   const [isSignedIn, setIsSignedIn] = useState(false);
+  const [isDemoMode, setIsDemoMode] = useState(false);
   const [isInitialized, setIsInitialized] = useState(false);
   const [projects, setProjects] = useState<ProjectAnalysis[]>([]);
   const [loading, setLoading] = useState(false);
@@ -26,20 +38,27 @@ const App: React.FC = () => {
   const [sortOrder, setSortOrder] = useState<SortOrder>('DEFAULT');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
-  const handleSaveConfig = (newId: string) => {
-    if (!newId) {
+  const handleSaveConfig = (newClientId: string, newSheetId: string) => {
+    // If clearing config
+    if (!newClientId || !newSheetId) {
       localStorage.removeItem('google_client_id');
-      setClientId('');
-      setIsInitialized(false);
+      localStorage.removeItem('google_spreadsheet_id');
+      // Reloading will re-initialize state, checking constants again.
+      // If constants exist, they will effectively be "restored" immediately.
       window.location.reload();
     } else {
-      const trimmed = newId.trim();
-      localStorage.setItem('google_client_id', trimmed);
-      setClientId(trimmed);
+      const trimmedClient = newClientId.trim();
+      const trimmedSheet = newSheetId.trim();
+      localStorage.setItem('google_client_id', trimmedClient);
+      localStorage.setItem('google_spreadsheet_id', trimmedSheet);
+      setClientId(trimmedClient);
+      setSheetId(trimmedSheet);
+      // Re-trigger auth init if client ID changed
       setIsInitialized(false);
     }
   };
 
+  // Auth Initialization
   useEffect(() => {
     if (!clientId) {
       setIsInitialized(true);
@@ -66,17 +85,19 @@ const App: React.FC = () => {
     initialize();
   }, [clientId]);
 
+  // Data Loading Trigger
   useEffect(() => {
-    if (isSignedIn) {
+    if (isSignedIn || isDemoMode) {
       loadData();
     }
-  }, [isSignedIn]);
+  }, [isSignedIn, isDemoMode]);
 
   const loadData = async () => {
     setLoading(true);
     setError(null);
     try {
-      const rawProjects = await fetchProjects();
+      // Pass demo mode flag to fetch service
+      const rawProjects = await fetchProjects(isDemoMode);
       const analyzed = analyzeProjects(rawProjects);
       setProjects(analyzed);
     } catch (err: any) {
@@ -104,7 +125,7 @@ const App: React.FC = () => {
         await updateProjectStatus(id, newStatus);
     } catch (err: any) {
         console.error("Write failed", err);
-        setError(err.message || "Failed to update status in Sheet.");
+        setError(err.message || "Failed to update status.");
         loadData();
     }
   };
@@ -130,8 +151,9 @@ const App: React.FC = () => {
   };
 
   const handleLogout = () => {
-    handleSignOut();
+    if (!isDemoMode) handleSignOut();
     setIsSignedIn(false);
+    setIsDemoMode(false);
     setProjects([]);
   }
 
@@ -170,7 +192,13 @@ const App: React.FC = () => {
         }
 
         if (comparison !== 0) return comparison;
-        return parseInt(b.project.id, 10) - parseInt(a.project.id, 10);
+        
+        // Handle mock IDs gracefully
+        const idA = parseInt(a.project.id, 10);
+        const idB = parseInt(b.project.id, 10);
+        if (isNaN(idA) || isNaN(idB)) return 0;
+        
+        return idB - idA;
     });
   }, [visibleProjects, sortOrder]);
 
@@ -185,8 +213,17 @@ const App: React.FC = () => {
       );
   }
 
-  if (!isSignedIn) {
-    return <LoginScreen hasValidConfig={!!clientId} onSaveConfig={handleSaveConfig} />;
+  // Show login if NOT signed in AND NOT in demo mode
+  if (!isSignedIn && !isDemoMode) {
+    return (
+        <LoginScreen 
+            hasValidConfig={!!clientId && !!sheetId} 
+            onSaveConfig={handleSaveConfig} 
+            onEnterDemo={() => setIsDemoMode(true)}
+            currentClientId={clientId}
+            currentSheetId={sheetId}
+        />
+    );
   }
 
   const abandonedCount = projects.filter(p => p.rotLevel === RotLevel.ABANDONED && p.project.status !== ProjectStatus.ARCHIVED).length;
@@ -199,7 +236,10 @@ const App: React.FC = () => {
       {/* Header - Scaled for Mobile */}
       <header className="mb-10 flex flex-col lg:flex-row lg:items-center justify-between gap-8 border-b border-slate-800 pb-10">
         <div>
-          <h1 className="text-5xl font-black text-white tracking-tighter mb-3">Project Watcher</h1>
+          <h1 className="text-5xl font-black text-white tracking-tighter mb-3">
+              Project Watcher 
+              {isDemoMode && <span className="ml-4 align-middle text-xs bg-indigo-600 px-2 py-1 rounded text-white uppercase tracking-widest border border-indigo-400">Demo Mode</span>}
+          </h1>
           <p className="text-lg text-slate-400 max-w-2xl leading-relaxed">Health dashboard for active initiatives. Spot the rot before it's too late.</p>
         </div>
         
@@ -220,7 +260,7 @@ const App: React.FC = () => {
             </div>
             
             <button onClick={handleLogout} className="text-sm font-bold text-slate-500 hover:text-white transition-colors uppercase tracking-widest bg-slate-900/50 px-4 py-2 rounded-lg border border-slate-800">
-                Sign Out
+                {isDemoMode ? 'Exit Demo' : 'Sign Out'}
             </button>
         </div>
       </header>

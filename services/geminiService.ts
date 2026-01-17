@@ -2,25 +2,24 @@
 import { GoogleGenAI, Chat, Modality, LiveServerMessage, Type, FunctionDeclaration } from "@google/genai";
 import { ProjectAnalysis, ProjectStatus } from "../types";
 
-// Recommended models
+// Recommended models - Updated to latest supported versions
 const TEXT_MODEL = 'gemini-3-flash-preview';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
-const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
+// CRITICAL FIX: Updated to the correct model for native audio live streaming
+const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 
-const getApiKey = () => {
-  let apiKey: string | undefined;
+// Helper to safely access process.env.API_KEY without crashing in browsers where 'process' is undefined
+const getApiKey = (): string | undefined => {
   try {
-    const rawKey = process.env.API_KEY;
-    if (rawKey) {
-      const clean = rawKey.toString().trim().replace(/^["']|["']$/g, '');
-      if (clean !== 'undefined' && clean !== 'null' && clean.length > 20) {
-        apiKey = clean;
-      }
+    // We check purely for the existence of the variable.
+    // We avoid 'process.env.API_KEY' direct access without check to prevent ReferenceError in pure ESM.
+    if (typeof process !== 'undefined' && process.env) {
+      return process.env.API_KEY;
     }
   } catch (e) {
-    console.warn("Error reading API_KEY:", e);
+    // Ignore reference errors
   }
-  return apiKey;
+  return undefined;
 };
 
 // Tool Definition for searching the spreadsheet
@@ -112,8 +111,6 @@ export const sendChatMessage = async (chat: Chat | null, message: string, onTool
       
       // Send results back to model to get final text
       const secondResponse = await chat.sendMessage({
-         // In @google/genai, sending tool responses back often requires standard message formatting
-         // but for this implementation we assume the standard sendMessage handles the turn if it returned calls.
          message: `Here are the search results: ${JSON.stringify(toolResults)}`
       });
       return secondResponse.text || "I found the data but couldn't summarize it.";
@@ -135,13 +132,14 @@ export const connectToLiveAnalyst = async (
     onInterrupted: () => void;
     onTranscription: (text: string, isUser: boolean) => void;
     onTurnComplete: () => void;
-    onClose: () => void;
+    onClose: (ev: CloseEvent) => void;
     onError: (e: any) => void;
     onToolCall: (fc: any) => Promise<any>;
   }
 ) => {
   const apiKey = getApiKey();
-  if (!apiKey) throw new Error("API Key missing");
+  // We throw a specific error that the UI can catch
+  if (!apiKey) throw new Error("API Key missing. Please check process.env.API_KEY configuration.");
 
   const ai = new GoogleGenAI({ apiKey });
   
@@ -171,8 +169,14 @@ export const connectToLiveAnalyst = async (
         if (message.serverContent?.inputTranscription) callbacks.onTranscription(message.serverContent.inputTranscription.text, true);
         if (message.serverContent?.turnComplete) callbacks.onTurnComplete();
       },
-      onclose: callbacks.onClose,
-      onerror: callbacks.onError,
+      onclose: (e) => {
+        console.log("Gemini Live Session Closed:", e);
+        callbacks.onClose(e);
+      },
+      onerror: (e) => {
+        console.error("Gemini Live Session Error:", e);
+        callbacks.onError(e);
+      },
     },
     config: {
       responseModalities: [Modality.AUDIO],
@@ -181,8 +185,6 @@ export const connectToLiveAnalyst = async (
       },
       systemInstruction: getSystemInstruction(projects),
       tools: [{ functionDeclarations: [searchProjectHistoryTool] }],
-      outputAudioTranscription: {},
-      inputAudioTranscription: {},
     }
   });
 

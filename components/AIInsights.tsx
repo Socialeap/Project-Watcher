@@ -4,8 +4,6 @@ import { ProjectAnalysis, ChatMessage } from '../types';
 import { 
   createProjectChatSession, 
   sendChatMessage, 
-  generateSpeech, 
-  playRawPcm,
   connectToLiveAnalyst,
   encode,
   decodeBase64,
@@ -18,6 +16,9 @@ interface AIInsightsProps {
   projects: ProjectAnalysis[];
 }
 
+// Helper to smooth visualizer values
+const interpolate = (start: number, end: number, factor: number) => start + (end - start) * factor;
+
 export const AIInsights: React.FC<AIInsightsProps> = ({ projects }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
@@ -26,17 +27,37 @@ export const AIInsights: React.FC<AIInsightsProps> = ({ projects }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState<number | null>(null);
   
   const [liveTranscription, setLiveTranscription] = useState('');
   const [isLiveActive, setIsLiveActive] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<string>(''); 
+  const [errorMessage, setErrorMessage] = useState<string>('');
+  
+  // Visualizer State
+  const [vizBars, setVizBars] = useState<number[]>([10, 10, 10, 10, 10]);
+  const [activeSpeaker, setActiveSpeaker] = useState<'user' | 'ai' | 'idle'>('idle');
+
+  // Mic Test State
+  const [isMicCheckActive, setIsMicCheckActive] = useState(false);
+  const [micTestLevel, setMicTestLevel] = useState(0);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  // Refs for Audio components
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null); 
+  const testContextRef = useRef<AudioContext | null>(null);
+  
+  // Analysers for Visuals
+  const inputAnalyserRef = useRef<AnalyserNode | null>(null);
+  const outputAnalyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  
   const nextStartTimeRef = useRef(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const liveSessionRef = useRef<any>(null);
+  const isManuallyClosingRef = useRef(false);
 
   useEffect(() => {
     if (projects.length > 0) {
@@ -50,13 +71,155 @@ export const AIInsights: React.FC<AIInsightsProps> = ({ projects }) => {
     if (isOpen) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isOpen]);
 
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      isManuallyClosingRef.current = true;
+      stopLiveMode();
+      stopMicCheck();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  // --- Visualizer Loop ---
+  const startVisualizerLoop = () => {
+    const bufferLength = 16; // Small FFT size for 5 bars
+    const dataArrayInput = new Uint8Array(bufferLength);
+    const dataArrayOutput = new Uint8Array(bufferLength);
+    
+    // Maintain current heights for smoothing
+    let currentHeights = [10, 10, 10, 10, 10];
+
+    const loop = () => {
+      let inputSum = 0;
+      let outputSum = 0;
+
+      // 1. Get Input (User) Data
+      if (inputAnalyserRef.current) {
+        inputAnalyserRef.current.getByteFrequencyData(dataArrayInput);
+        inputSum = dataArrayInput.reduce((a, b) => a + b, 0) / bufferLength;
+      }
+
+      // 2. Get Output (AI) Data
+      if (outputAnalyserRef.current) {
+        outputAnalyserRef.current.getByteFrequencyData(dataArrayOutput);
+        outputSum = dataArrayOutput.reduce((a, b) => a + b, 0) / bufferLength;
+      }
+
+      // 3. Determine Dominant Source & Color
+      let targetData = dataArrayInput;
+      let speaker: 'user' | 'ai' | 'idle' = 'idle';
+
+      // Prioritize AI output visual if it's making sound (> 5 to filter noise)
+      if (outputSum > 5) {
+        speaker = 'ai';
+        targetData = dataArrayOutput;
+      } else if (inputSum > 5) {
+        speaker = 'user';
+        targetData = dataArrayInput;
+      }
+
+      setActiveSpeaker(speaker);
+
+      // 4. Map Frequency Bands to 5 Bars
+      // We pick specific indices from the FFT array to represent Bass -> Treble
+      // FFT Size 32 -> ~16 bins. 
+      // Indices: 0 (Bass), 2, 4, 7, 10 (Treble)
+      const indices = [0, 2, 4, 7, 10];
+      const targetHeights = indices.map(i => {
+         const val = targetData[i] || 0;
+         // Normalize 0-255 to 10-100%
+         return Math.max(10, (val / 255) * 100);
+      });
+
+      // 5. Smooth Transition
+      currentHeights = currentHeights.map((h, i) => interpolate(h, targetHeights[i], 0.3));
+      
+      setVizBars([...currentHeights]);
+
+      rafRef.current = requestAnimationFrame(loop);
+    };
+
+    loop();
+  };
+
   const stopLiveMode = () => {
     setIsLiveActive(false);
-    setIsLiveMode(false);
-    if (liveSessionRef.current) liveSessionRef.current.close();
-    if (audioContextRef.current) audioContextRef.current.close();
-    activeSourcesRef.current.forEach(s => s.stop());
+    if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+    }
+    setVizBars([10, 10, 10, 10, 10]);
+    setActiveSpeaker('idle');
+
+    if (liveSessionRef.current) {
+        try { liveSessionRef.current.close(); } catch(e) {}
+        liveSessionRef.current = null;
+    }
+    
+    if (processorRef.current) {
+        try { 
+            processorRef.current.disconnect(); 
+            processorRef.current.onaudioprocess = null;
+        } catch (e) {}
+        processorRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+    }
+    if (outputAudioContextRef.current) {
+        outputAudioContextRef.current.close();
+        outputAudioContextRef.current = null;
+    }
+    
+    activeSourcesRef.current.forEach(s => {
+        try { s.stop(); } catch(e) {}
+    });
+    activeSourcesRef.current.clear();
     setLiveTranscription('');
+  };
+
+  const stopMicCheck = () => {
+      if (testContextRef.current) {
+          testContextRef.current.close();
+          testContextRef.current = null;
+      }
+      setIsMicCheckActive(false);
+      setMicTestLevel(0);
+  };
+
+  const toggleMicCheck = async () => {
+    if (isMicCheckActive) {
+      stopMicCheck();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      testContextRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      
+      setIsMicCheckActive(true);
+      
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const draw = () => {
+        if (!testContextRef.current || testContextRef.current.state === 'closed') return;
+        analyser.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        setMicTestLevel(average); 
+        requestAnimationFrame(draw);
+      };
+      draw();
+      setTimeout(() => { if (testContextRef.current) stopMicCheck(); }, 15000);
+    } catch (e) {
+      console.error(e);
+      alert("Microphone access failed. Please check system permissions.");
+    }
   };
 
   const handleToolCall = async (fc: any) => {
@@ -65,53 +228,174 @@ export const AIInsights: React.FC<AIInsightsProps> = ({ projects }) => {
   };
 
   const startLiveMode = async () => {
+    stopMicCheck();
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      audioContextRef.current = inputCtx;
-      outputAudioContextRef.current = outputCtx;
-      setIsLiveActive(true);
+      setConnectionStatus('connecting');
+      setErrorMessage('');
       setIsLiveMode(true);
+      isManuallyClosingRef.current = false;
+      
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // --- INPUT SETUP (USER) ---
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextRef.current = inputCtx;
+      
+      // Create Analyser for User Input
+      const inputAnalyser = inputCtx.createAnalyser();
+      inputAnalyser.fftSize = 32; // Low res for visualizer bars
+      inputAnalyserRef.current = inputAnalyser;
+
+      // Resampling Checks
+      const actualSampleRate = inputCtx.sampleRate;
+      const targetSampleRate = 16000;
+      const needsResampling = actualSampleRate !== targetSampleRate;
+      
+      // --- OUTPUT SETUP (AI) ---
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      outputAudioContextRef.current = outputCtx;
+
+      // Create Analyser for AI Output
+      const outputAnalyser = outputCtx.createAnalyser();
+      outputAnalyser.fftSize = 32;
+      outputAnalyserRef.current = outputAnalyser;
+      
+      // Ensure AI output goes through analyser -> destination
+      outputAnalyser.connect(outputCtx.destination);
+
+      setIsLiveActive(true);
+      startVisualizerLoop(); // Start Animation
 
       const sessionPromise = connectToLiveAnalyst(projects, {
         onAudioChunk: async (base64) => {
           const ctx = outputAudioContextRef.current;
-          if (!ctx) return;
+          const analyser = outputAnalyserRef.current;
+          if (!ctx || !analyser) return;
+
+          if (ctx.state === 'suspended') await ctx.resume();
+
           nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
           const audioBuffer = await decodeAudioData(decodeBase64(base64), ctx, 24000, 1);
           const source = ctx.createBufferSource();
           source.buffer = audioBuffer;
-          source.connect(ctx.destination);
+          
+          // CRITICAL: Connect Source -> Analyser (which is already connected to Destination)
+          source.connect(analyser);
+          
+          source.onended = () => { activeSourcesRef.current.delete(source); };
           source.start(nextStartTimeRef.current);
           nextStartTimeRef.current += audioBuffer.duration;
           activeSourcesRef.current.add(source);
         },
         onInterrupted: () => {
           activeSourcesRef.current.forEach(s => s.stop());
+          activeSourcesRef.current.clear();
           nextStartTimeRef.current = 0;
+          if (outputAudioContextRef.current) nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
         },
         onTranscription: (text) => setLiveTranscription(text),
         onToolCall: handleToolCall,
         onTurnComplete: () => setTimeout(() => setLiveTranscription(''), 3000),
-        onClose: () => stopLiveMode(),
-        onError: (e) => { console.error(e); stopLiveMode(); }
+        onClose: (ev) => {
+            if (!isManuallyClosingRef.current) {
+                console.warn("Unexpected closure", ev);
+                setConnectionStatus('closed_unexpectedly');
+                stopLiveMode();
+                setIsLiveMode(true); 
+            } else {
+                stopLiveMode();
+                setIsLiveMode(false);
+            }
+        },
+        onError: (e) => { 
+            console.error("Live API Error", e); 
+            setConnectionStatus('error');
+            setErrorMessage(e.message || "Unknown API Error");
+            stopLiveMode();
+            setIsLiveMode(true); 
+        }
       });
 
       liveSessionRef.current = await sessionPromise;
+      setConnectionStatus('connected');
+
+      // --- PROCESS INPUT AUDIO ---
       const source = inputCtx.createMediaStreamSource(stream);
       const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor; 
+      
+      let resampleBuffer: number[] = [];
+      
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        const int16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
-        if (liveSessionRef.current) liveSessionRef.current.sendRealtimeInput({ media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } });
+        
+        let finalData: Float32Array;
+        
+        if (needsResampling) {
+            const ratio = actualSampleRate / targetSampleRate;
+            for (let i = 0; i < inputData.length; i++) {
+                resampleBuffer.push(inputData[i]);
+            }
+            const neededLen = Math.floor(resampleBuffer.length / ratio);
+            if (neededLen > 0) {
+                const resampled = new Float32Array(neededLen);
+                for (let i = 0; i < neededLen; i++) {
+                    const index = Math.floor(i * ratio);
+                    resampled[i] = resampleBuffer[index];
+                }
+                finalData = resampled;
+                const usedInputIndex = Math.floor(neededLen * ratio);
+                resampleBuffer = resampleBuffer.slice(usedInputIndex);
+            } else {
+                return;
+            }
+        } else {
+            finalData = inputData;
+        }
+        
+        const int16 = new Int16Array(finalData.length);
+        for (let i = 0; i < finalData.length; i++) {
+            let s = Math.max(-1, Math.min(1, finalData[i]));
+            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        
+        if (liveSessionRef.current) {
+             liveSessionRef.current.sendRealtimeInput({ 
+                 media: { 
+                     data: encode(new Uint8Array(int16.buffer)), 
+                     mimeType: 'audio/pcm;rate=16000' 
+                 } 
+             });
+        }
       };
-      source.connect(processor);
-      processor.connect(inputCtx.destination);
-    } catch (err) {
-      alert("Microphone required for analyst voice mode.");
+
+      const muteGain = inputCtx.createGain();
+      muteGain.gain.value = 0; 
+      
+      // Graph: Source -> InputAnalyser -> Processor -> Mute -> Dest
+      source.connect(inputAnalyser);
+      inputAnalyser.connect(processor);
+      processor.connect(muteGain);
+      muteGain.connect(inputCtx.destination);
+
+    } catch (err: any) {
+      console.error(err);
+      stopLiveMode();
+      setIsLiveMode(true); 
+      setConnectionStatus('error');
+      setErrorMessage(err.message || "Failed to initialize audio or connection.");
+      
+      if (err.name === 'NotAllowedError') {
+          alert("Microphone access denied.");
+      }
     }
+  };
+
+  const handleManualDisconnect = () => {
+      isManuallyClosingRef.current = true;
+      stopLiveMode();
+      setIsLiveMode(false);
   };
 
   const handleSend = async () => {
@@ -169,28 +453,102 @@ export const AIInsights: React.FC<AIInsightsProps> = ({ projects }) => {
 
         <div className="bg-slate-900 p-4 border-b-2 border-slate-950 flex gap-4">
             <button 
-              onClick={() => isLiveActive ? stopLiveMode() : startLiveMode()}
-              className={`flex-1 py-5 rounded-2xl font-black uppercase tracking-widest text-sm transition-all shadow-xl border-2 flex items-center justify-center gap-3 ${
+              onClick={() => isLiveActive ? handleManualDisconnect() : startLiveMode()}
+              className={`flex-1 py-4 rounded-2xl font-black uppercase tracking-widest text-sm transition-all shadow-xl border-2 flex items-center justify-center gap-3 ${
                 isLiveActive ? 'bg-red-600 border-red-500 text-white' : 'bg-indigo-600 border-indigo-500 text-white'
               }`}
             >
-              {isLiveActive ? 'DISCONNECT' : 'VOICE CHAT'}
+              {isLiveActive ? (
+                <>
+                   <span className="animate-pulse">●</span> Disconnect
+                </>
+              ) : 'Start Voice Chat'}
+            </button>
+            
+            <button
+                onClick={toggleMicCheck}
+                disabled={isLiveActive}
+                className={`px-4 rounded-2xl border-2 font-bold transition-all ${isMicCheckActive ? 'bg-emerald-900/50 border-emerald-500 text-emerald-300' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed'}`}
+                title="Test Microphone"
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5"><path fillRule="evenodd" d="M7 10a3 3 0 0 1 3-3 3 3 0 0 1 3 3h-6Z" clipRule="evenodd" /><path fillRule="evenodd" d="M6.5 10a3.5 3.5 0 0 1 3.5-3.5 3.5 3.5 0 0 1 3.5 3.5h-7Z" clipRule="evenodd" /><path d="M10 4a6 6 0 0 0-6 6h12a6 6 0 0 0-6-6Z" /><path fillRule="evenodd" d="M10 2a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM4.25 10a5.75 5.75 0 0 1 11.5 0h-11.5Z" clipRule="evenodd" /></svg>
             </button>
         </div>
 
         <div className="flex-1 flex flex-col min-h-0 bg-slate-950/80">
+          
+          {/* MIC TEST OVERLAY */}
+          {isMicCheckActive && !isLiveActive && (
+              <div className="absolute inset-0 z-20 bg-slate-950 flex flex-col items-center justify-center p-8 space-y-6 animate-fade-in">
+                  <h3 className="text-xl font-bold text-white">Microphone Check</h3>
+                  <div className="w-full max-w-[200px] h-40 bg-slate-900 rounded-3xl border-2 border-slate-800 flex items-end justify-center p-4 overflow-hidden relative">
+                       <div 
+                         className="w-full bg-emerald-500 rounded-t-xl transition-all duration-75"
+                         style={{ height: `${Math.min(100, (micTestLevel / 128) * 100)}%` }}
+                       ></div>
+                       
+                       {/* Threshold markers */}
+                       <div className="absolute bottom-[20%] w-full h-px bg-slate-700 border-t border-dashed"></div>
+                       <div className="absolute bottom-[50%] w-full h-px bg-slate-700 border-t border-dashed"></div>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-slate-400 text-sm mb-2">Speak now to test input...</p>
+                    <p className="text-xs text-slate-600 font-mono">Level: {micTestLevel.toFixed(1)}</p>
+                  </div>
+                  <button onClick={toggleMicCheck} className="px-6 py-2 bg-slate-800 rounded-xl text-white font-bold border border-slate-700">Stop Test</button>
+              </div>
+          )}
+
           {isLiveMode ? (
             <div className="flex-1 flex flex-col items-center justify-center p-12 space-y-10 text-center relative">
-                <div className="flex items-end justify-center gap-3 h-32 w-full max-w-[250px]">
-                  {[...Array(15)].map((_, i) => (
-                    <div key={i} className="flex-1 bg-indigo-500 rounded-full transition-all duration-75" style={{ height: isLiveActive ? `${10 + Math.random() * 90}%` : '8%', opacity: isLiveActive ? 0.6 + Math.random() * 0.4 : 0.2 }}></div>
-                  ))}
+                
+                {/* ACTIVE VISUALIZER */}
+                <div className="flex items-center justify-center gap-2 h-32 w-full max-w-[250px]">
+                  {vizBars.map((height, i) => {
+                    // Determine Color Based on Speaker
+                    let bgColor = 'bg-slate-700';
+                    if (activeSpeaker === 'user') bgColor = 'bg-emerald-500';
+                    else if (activeSpeaker === 'ai') bgColor = 'bg-indigo-500';
+                    
+                    return (
+                        <div 
+                            key={i} 
+                            className={`flex-1 rounded-full transition-all duration-[50ms] ease-linear ${bgColor} shadow-[0_0_15px_rgba(0,0,0,0.5)]`}
+                            style={{ 
+                                height: `${height}%`,
+                                opacity: activeSpeaker === 'idle' ? 0.3 : 1
+                            }}
+                        ></div>
+                    );
+                  })}
                 </div>
-                <div className="space-y-4">
-                  <h3 className="text-3xl font-black text-white tracking-tighter uppercase">{isLiveActive ? 'Listening...' : 'Connecting'}</h3>
-                  <div className="bg-slate-900/80 border-2 border-slate-800 rounded-3xl p-8 min-h-[200px] flex items-center justify-center text-xl font-medium text-slate-200 shadow-2xl">
-                    {liveTranscription || "I'm ready. Ask me about project health or history."}
-                  </div>
+
+                <div className="space-y-4 w-full">
+                  <h3 className="text-3xl font-black text-white tracking-tighter uppercase transition-colors duration-300">
+                      {connectionStatus === 'connecting' && 'Connecting...'}
+                      {connectionStatus === 'connected' && (
+                          activeSpeaker === 'user' ? <span className="text-emerald-400">Listening...</span> :
+                          activeSpeaker === 'ai' ? <span className="text-indigo-400">Speaking...</span> :
+                          'Standby'
+                      )}
+                      {connectionStatus === 'error' && <span className="text-red-500">Connection Failed</span>}
+                      {connectionStatus === 'closed_unexpectedly' && <span className="text-orange-500">Session Ended</span>}
+                  </h3>
+                  
+                  {connectionStatus === 'error' || connectionStatus === 'closed_unexpectedly' ? (
+                      <div className="bg-red-950/50 border-2 border-red-900 rounded-2xl p-6 text-red-200 text-sm">
+                          <p className="font-bold mb-2">{connectionStatus === 'error' ? 'Lost connection to AI service.' : 'Session closed unexpectedly.'}</p>
+                          {errorMessage && <p className="font-mono text-xs bg-red-900/50 p-2 rounded mb-2">{errorMessage}</p>}
+                          <p className="text-xs opacity-70">Check your API Key and Model availability.</p>
+                          <button onClick={() => { setIsLiveMode(false); setConnectionStatus(''); }} className="mt-4 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-white font-bold transition-all">
+                              Close
+                          </button>
+                      </div>
+                  ) : (
+                    <div className="bg-slate-900/80 border-2 border-slate-800 rounded-3xl p-8 min-h-[150px] flex items-center justify-center text-xl font-medium text-slate-200 shadow-2xl transition-all">
+                        {liveTranscription || <span className="opacity-30 italic">Conversation active...</span>}
+                    </div>
+                  )}
                 </div>
             </div>
           ) : (

@@ -1,8 +1,11 @@
+
 <!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- CHANGED: Standard referrer policy for maximum compatibility -->
+    <meta name="referrer" content="no-referrer-when-downgrade" />
     <title>Project Watcher Dashboard</title>
     
     <!-- PWA & Mobile Meta Tags -->
@@ -44,6 +47,15 @@
     "react-dom/": "https://esm.sh/react-dom@^19.2.3/"
   }
 }
+</script>
+<!-- Environment Polyfill for Static Deployment -->
+<script>
+  window.process = {
+    env: {
+      // ACTION REQUIRED: Replace with your actual Gemini API Key for production use
+      API_KEY: 'AIzaSyBg-4wjus1S8vRAPkVYCzS1GlYOnhfuTYA'
+    }
+  };
 </script>
 <!-- Google Identity Services & API Client -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
